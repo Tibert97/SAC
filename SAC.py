@@ -75,11 +75,10 @@ class Agent(nn.Module):
         normal = Normal(mean, std)
 
         sampled_action = normal.rsample()
-        log_prob = normal.log_prob(sampled_action)
+        log_prob = torch.sum(normal.log_prob(sampled_action),dim=1)
+        log_prob -= torch.sum((2*(np.log(2) - sampled_action - F.softplus(-2*sampled_action))),dim=1)
         
-        
-    
-        return torch.tanh(sampled_action)*self.action_limit,log_prob,mean
+        return torch.tanh(sampled_action)*self.action_limit,log_prob,torch.tanh(mean)*self.action_limit
 
 class A_Critic(nn.Module):
     def __init__(self,d_state,d_action):
@@ -142,7 +141,7 @@ class ReplayBuffer(object):
   def __len__(self):
     return len(self.memory)
 
-    """
+"""
 Utility functions to enable video recording of gym environment and displaying it
 To enable video, just do "env = wrap_env(env)""
 """
@@ -152,7 +151,7 @@ To enable video, just do "env = wrap_env(env)""
 def show_video():
   mp4list = glob.glob('video/*.mp4')
   if len(mp4list) > 0:
-    mp4 = mp4list[0]
+    mp4 = mp4list[-1]
     video = io.open(mp4, 'r+b').read()
     encoded = base64.b64encode(video)
     ipythondisplay.display(HTML(data='''<video alt="test" autoplay 
@@ -171,26 +170,9 @@ def delete_videos():
   mp4list = glob.glob('video/*.mp4')
   for f in mp4list:
     os.remove(f)
-            
-def plot_model_losses():
-  plt.plot(range(len(g_losses)), g_losses,'r', label="Generator")
-  plt.plot(range(len(c_real_losses)), c_real_losses, 'b', label='Critic real')
-  plt.plot(range(len(c_fake_losses)), c_fake_losses, 'g', label='Critic fake')
-  plt.plot(range(len(c_overall_losses)), c_overall_losses, 'y', label='Critic')
-  plt.xlabel("Epoch")
-  plt.ylabel("Critic Evaluation")
-  plt.legend()
-  plt.show()
-
-def model_training(epochs):
-  gen.train()
-  crit.train()
-  gan_training(epochs)
-  gen.eval()
-  crit.eval()
   
 
-def environment_step(environment,obs):  
+def environment_step(environment,obs,step_counter):  
   with torch.no_grad():
     agent_input = torch.Tensor(obs).view(1,-1).to(device)
     agent.eval()
@@ -199,12 +181,17 @@ def environment_step(environment,obs):
     action = action[0].cpu().numpy()
     observation, reward, done, info = env.step(action) 
     env.render()
+    step_counter += 1
     if done:
-      alive = 0
+      if step_counter == episode_length:
+        alive = 1
+      else:
+        alive = 0
+      show_video()
     else:
       alive = 1
     replay_buffer.add_sample(np.concatenate((obs[:d_state],action,observation[:d_state],[alive],[reward])))
-    return observation,reward,done
+    return observation,reward,done,step_counter
 
 def compute_q_targets(samples):
   s = samples[:,:d_state]
@@ -218,10 +205,7 @@ def compute_q_targets(samples):
   critic_1_output = a_critic_target_1(s_new,policy).squeeze()
   critic_2_output = a_critic_target_2(s_new,policy).squeeze()
   minimum_outputs = torch.min(critic_1_output,critic_2_output)
-  try:
-    targets = r + GAMMA * d * (minimum_outputs-alpha_entropy*(torch.sum(log_prob.squeeze(),dim=1)))
-  except:
-    targets = r + GAMMA * d * (minimum_outputs-alpha_entropy*(log_prob.squeeze()))
+  targets = r + GAMMA * d * (minimum_outputs-alpha_entropy*log_prob)
 
   return targets
 
@@ -242,7 +226,8 @@ def update_q_network(targets,samples):
   loss_2.backward()
   q_a_optimizer_2.step()
 
-  q_a_losses.append(loss_1.item())
+  q_a_losses_1.append(loss_1.item())
+  q_a_losses_2.append(loss_2.item())
 
 
 def update_agent_network(samples):
@@ -254,8 +239,12 @@ def update_agent_network(samples):
   q_2 = a_critic_2(s, actions)
   q_min = torch.min(q_1,q_2)
 
-  loss = torch.mean(-(q_min-alpha_entropy*log_prob.squeeze()))
-  a_losses.append(loss.item())
+  q_loss = torch.mean(-q_min)
+  entropy_loss = torch.mean(alpha_entropy*log_prob)
+  loss = q_loss+entropy_loss
+  a_losses_q.append(q_loss.item())
+  a_losses_entropy.append(entropy_loss.item())
+  a_losses_overall.append(loss.item())
 
   loss.backward()
   a_optimizer.step()
@@ -282,65 +271,88 @@ def compare_q_values():
   with torch.no_grad():
     s = sample[:,:d_state]
     a = sample[:,d_state:d_state+d_action]
+    a_critic_1.eval()
+    a_critic_target_1.eval()
+    a_critic_target_2.eval()
+    agent.eval()
     predictions = a_critic_1(s,a).squeeze()
     targets = compute_q_targets(sample)
     print('Target:',targets, 'Predictions:',predictions)
+    a_critic_1.train()
+    a_critic_target_1.train()
+    a_critic_target_2.train()
+    agent.train()
 
-def test_agent():
-  agent.eval()
-  with torch.no_grad():
-    env = gym.make(environment_name)
-    all_rewards = list()
 
-    for i in range(100):
-        print(str(i))
-        all_rewards.append(act_in_environment())
-
-    print('Overall mean',np.mean(all_rewards))
-    print('Overall std', np.std(all_rewards))
-    print('Overall median',np.median(all_rewards))
-
-def act_in_environment():
+def act_in_environment(env):
   with torch.no_grad():
     obs = env.reset()
+    env.render()
+    agent.eval()
     cum_reward = 0
     while True:
       agent_input = torch.Tensor(obs).view(1,-1).to(device)
       _,_,action = agent(agent_input)
-      action = action[0,0].item()
-      observation, reward, done, info = env.step([action]) 
+      observation, reward, done, info = env.step(action.squeeze(dim=0).cpu()) 
       env.render()
       obs = observation
       cum_reward += reward
       if done:
         break
+    agent.train()
     print(cum_reward)
+    show_video()
+    env.close()
     return cum_reward
 
 def plot_policy_losses():
     fig, ax1 = plt.subplots()
     ax2 = ax1.twinx()
-    ax1.plot(range(len(q_a_losses)), q_a_losses, 'g', label = 'Q Loss')
-    ax2.plot(range(len(a_losses)), a_losses,'r', label="Agent Loss")
+    ax1.plot(range(len(q_a_losses_1)), q_a_losses_1, 'g', label = 'Q1 Loss')
+    ax2.plot(range(len(q_a_losses_2)), q_a_losses_2, 'b', label = 'Q2 Loss')
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Q Loss")
+    ax1.set_ylabel("Q1 Loss")
+    ax2.set_ylabel("Q2 Loss")
+    plt.legend()
+    plt.show()
+
+    fig, ax1 = plt.subplots()
+    ax2 = ax1.twinx()
+    ax2.plot(range(len(a_losses_q)), a_losses_q,'y', label="Agent Q Loss")
+    ax1.plot(range(len(a_losses_entropy)), a_losses_entropy,'m', label="Agent Entropy Loss")
+    ax2.plot(range(len(a_losses_overall)), a_losses_overall,'r', label="Agent Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Entropy Loss")
     ax2.set_ylabel("Agent Loss")
     plt.legend()
     plt.show()
 
+
+g_lr = 1e-4
+c_lr = 1e-4
 a_lr = 1e-3
 q_a_lr = 1e-3
+critic_steps = 5
+gan_epochs_start = 2000
+gan_epochs = 10
+agent_epochs = 10
+LAMBDA = 10
 GAMMA = 0.99
 alpha_entropy = 0.2
 tau = 0.995
-agent_batches = 64
-environment_name = 'AntBulletEnv-v0'
+agent_batches = 100
+batch_size_train = 64
+buffer = list()
+environment_name = 'HopperBulletEnv-v0'
 env = gym.make(environment_name)
 d_state = env.observation_space.shape[0]
 d_action = env.action_space.shape[0]
 action_limit_max = env.action_space.high[0]
 action_limit_min = env.action_space.low[0]
+episode_length = env._max_episode_steps
 
+gen = Generator(d_state,d_action).to(device)
+crit = Critic(d_state,d_action).to(device)
 agent = Agent(d_state,d_action,action_limit_max).to(device)
 a_critic_1 = A_Critic(d_state,d_action).to(device)
 a_critic_target_1 = copy.deepcopy(a_critic_1)
@@ -348,8 +360,15 @@ a_critic_2 = A_Critic(d_state,d_action).to(device)
 a_critic_target_2 = copy.deepcopy(a_critic_2)
 
 replay_buffer = ReplayBuffer(1000000)
-a_losses = list()
-q_a_losses = list()
+c_overall_losses = list()
+c_real_losses = list()
+c_fake_losses = list()
+g_losses = list()
+a_losses_q = list()
+a_losses_entropy = list()
+a_losses_overall = list()
+q_a_losses_1 = list()
+q_a_losses_2 = list()
 
 #initialise the buffer
 
@@ -357,17 +376,23 @@ env = gym.make(environment_name)
 d_state = env.observation_space.shape[0]
 print(d_state)
 d_action = env.action_space.shape[0]
+episode_length = env._max_episode_steps
 print(d_action)
-for t in range(10):
+for t in range(1000):
   start = env.reset()
+  step_counter = 0
   observation = start
   while True:
   #  time.sleep(1./60.)
     action = env.action_space.sample()
     obs = observation
     observation, reward, done, info = env.step(action)
+    step_counter += 1
     if done:
-      alive = 0
+      if step_counter == episode_length:
+        alive = 1
+      else:
+        alive = 0
     else:
       alive = 1
     replay_buffer.add_sample(np.concatenate((obs[:d_state],action,observation[:d_state],[alive],[reward])))
@@ -381,23 +406,26 @@ a_optimizer= optim.Adam(agent.parameters(), lr=a_lr)
 q_a_optimizer_1 = optim.Adam(a_critic_1.parameters(), lr=q_a_lr)
 q_a_optimizer_2 = optim.Adam(a_critic_2.parameters(), lr=q_a_lr)
 
-env = (gym.make(environment_name))
+env = wrap_env(gym.make(environment_name))
 obs = env.reset()
+env.render()
+step_counter = 0
 cum_reward = 0
+plot_model_losses()
 episode_counter = 1
 for i in range(int(1e6)):
-    obs,reward,done = environment_step(env,obs)
+    obs,reward,done,step_counter = environment_step(env,obs,step_counter)
     cum_reward += reward
-    agent_training(replay_buffer, epochs = 1)
+    if i % 50 == 0 and i != 0:
+      agent_training(replay_buffer, epochs = 50)
     if done:
       print('Episode number',episode_counter)
       print('Total reward of episode:', cum_reward)
       cum_reward = 0
       compare_q_values()
       plot_policy_losses()
-      show_video()
-      env = wrap_env(gym.make(environment_name))
       obs = env.reset()
+      step_counter = 0
       env.render()
       episode_counter += 1
   
